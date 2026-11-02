@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PPC Shop Mapper</title>
+<style>
+:root{--bg:#121518;--panel:#1b2025;--fg:#e8ebed;--muted:#97a1a8;--accent:#f2a53a;--ok:#5cc28a;--bad:#e5675a;--line:#2b3238;
+--sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;--mono:ui-monospace,Consolas,monospace;color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 var(--sans)}
+header{padding:14px 18px;border-bottom:1px solid var(--line);display:flex;gap:12px;align-items:baseline;flex-wrap:wrap}
+header h1{margin:0;font-size:18px}
+header span{font-family:var(--mono);font-size:12px;color:var(--muted)}
+main{max-width:860px;margin:0 auto;padding:18px;display:grid;gap:18px}
+section{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:16px 18px}
+h2{margin:0 0 10px;font-size:15px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
+ol{margin:0;padding-left:20px}
+li{margin:4px 0}
+table{width:100%;border-collapse:collapse;font-size:14px}
+td,th{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line)}
+th{color:var(--muted);font-weight:600}
+td.num{font-family:var(--mono);font-variant-numeric:tabular-nums}
+kbd{font-family:var(--mono);font-size:12px;background:var(--bg);border:1px solid var(--line);border-radius:3px;padding:1px 6px}
+button{font:600 16px var(--sans);background:var(--accent);color:#1a1206;border:0;border-radius:5px;padding:14px 22px;cursor:pointer}
+button.secondary{background:var(--line);color:var(--fg)}
+button:disabled{opacity:.45;cursor:default}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+#status{font-family:var(--mono);font-size:13px;color:var(--muted)}
+#status.bad{color:var(--bad)} #status.ok{color:var(--ok)}
+#preview{width:100%;height:380px;display:block;border-radius:5px;background:#0c0e10}
+.hidden{display:none!important}
+</style>
+</head>
+<body>
+<header><h1>PPC Shop Mapper</h1><span>v0.1 · Meta Quest 3 · Paragon Protective Coatings</span></header>
+<main>
+  <section>
+    <h2>Map a space</h2>
+    <ol>
+      <li>On the Quest, run <b>Settings › Physical space › Space setup</b> for the room first. The mapper reads that scan.</li>
+      <li>Open this page in the Quest browser and press <b>Start mapping</b>. You'll see the shop through passthrough with the scanned mesh drawn over it.</li>
+      <li>Walk the room and drop station markers where training happens.</li>
+      <li>Press the Meta button and exit to finish, then save the map below.</li>
+    </ol>
+    <div class="row" style="margin-top:14px">
+      <button id="start" disabled>Checking headset…</button>
+      <span id="status"></span>
+    </div>
+  </section>
+
+  <section>
+    <h2>Controls in the headset</h2>
+    <table>
+      <tr><th>Control</th><th>Does</th></tr>
+      <tr><td><kbd>Right trigger</kbd></td><td>Drop a station marker where the right ray hits</td></tr>
+      <tr><td><kbd>A</kbd></td><td>Next station type (Blast booth, Paint booth, XP70 pump…)</td></tr>
+      <tr><td><kbd>B</kbd></td><td>Undo last marker</td></tr>
+      <tr><td><kbd>Left trigger</kbd></td><td>Tape measure: first pull sets point A, second sets point B</td></tr>
+      <tr><td><kbd>X</kbd></td><td>Clear the tape measure</td></tr>
+      <tr><td><kbd>Y</kbd></td><td>Show or hide the mesh overlay</td></tr>
+      <tr><td><kbd>Left grip</kbd></td><td>Open Space Setup if no room scan is found</td></tr>
+    </table>
+  </section>
+
+  <section id="results" class="hidden">
+    <h2>Last map</h2>
+    <p id="summary"></p>
+    <canvas id="preview"></canvas>
+    <table id="stationTable" style="margin-top:12px"></table>
+    <div class="row" style="margin-top:14px">
+      <button id="saveGlb">Save map (.glb)</button>
+      <button id="saveJson" class="secondary">Save stations (.json)</button>
+    </div>
+  </section>
+</main>
+
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import {GLTFExporter} from 'three/addons/exporters/GLTFExporter.js';
+import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
+
+const STATIONS=['Blast booth','Paint booth','Thermal spray','XP70 pump','Mix room','Staging','Exit','Eyewash','Fire extinguisher','Hazard'];
+const STATION_COLORS=[0xf2a53a,0x4aa8ff,0xd76cff,0x5cc28a,0xffd84a,0x9aa4ab,0x3fe0c5,0x40c4ff,0xff4a4a,0xff8a3a];
+const LABEL_COLORS={floor:0x8a6f3e,wall:0x4f7fa8,ceiling:0x6b6f8a,table:0x5c9a6a,couch:0x5c9a6a,door_frame:0xf2a53a,window_frame:0x40c4ff,storage:0x9a7a5c,screen:0x40c4ff,other:0x8a9298,global_mesh:0x7f8a92};
+
+const $=id=>document.getElementById(id);
+const startBtn=$('start'),statusEl=$('status');
+function setStatus(t,cls=''){statusEl.textContent=t;statusEl.className=cls;}
+
+// ---------- three setup ----------
+const renderer=new THREE.WebGLRenderer({antialias:true,alpha:true});
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+renderer.xr.enabled=true;
+renderer.xr.setReferenceSpaceType('local-floor');
+renderer.domElement.classList.add('hidden');document.body.appendChild(renderer.domElement);
+const scene=new THREE.Scene();
+const camera=new THREE.PerspectiveCamera(60,1,0.02,200);
+scene.add(new THREE.HemisphereLight(0xffffff,0x444444,2));
+
+const mapGroup=new THREE.Group(); scene.add(mapGroup);
+const planeGroup=new THREE.Group(); scene.add(planeGroup);
+const markerGroup=new THREE.Group(); scene.add(markerGroup);
+const measureGroup=new THREE.Group(); scene.add(measureGroup);
+
+const meshRecs=new Map();   // XRMesh -> {obj,t,label}
+const planeRecs=new Map();  // XRPlane -> {obj,t,label,area}
+let markers=[];             // {type,colorIdx,pos:THREE.Vector3,obj}
+let stationIdx=0;
+let measurePts=[];
+let meshVisible=true;
+let session=null, sessionStart=0;
+
+function labelColor(l){return LABEL_COLORS[(l||'other').toLowerCase()]??LABEL_COLORS.other;}
+
+function textSprite(text,color='#ffffff',bg='rgba(10,12,14,.82)',scale=0.5){
+  const c=document.createElement('canvas');c.width=512;c.height=128;const g=c.getContext('2d');
+  g.fillStyle=bg;g.fillRect(0,0,512,128);g.fillStyle=color;g.font='600 52px system-ui,sans-serif';g.textAlign='center';g.textBaseline='middle';
+  g.fillText(text,256,66,496);
+  const s=new THREE.Sprite(new THREE.SpriteMaterial({map:new THREE.CanvasTexture(c),depthTest:false}));
+  s.scale.set(scale,scale/4,1);s.renderOrder=10;return s;
+}
+
+// ---------- room mesh + planes from the Quest ----------
+function updateMeshes(frame,ref){
+  const set=frame.detectedMeshes; if(!set) return;
+  for(const m of set){
+    let rec=meshRecs.get(m);
+    if(!rec||rec.t!==m.lastChangedTime){
+      if(rec){mapGroup.remove(rec.obj);rec.obj.geometry.dispose();}
+      const geo=new THREE.BufferGeometry();
+      geo.setAttribute('position',new THREE.BufferAttribute(new Float32Array(m.vertices),3));
+      geo.setIndex(new THREE.BufferAttribute(new Uint32Array(m.indices),1));
+      geo.computeVertexNormals();
+      const label=m.semanticLabel||'global_mesh';
+      const obj=new THREE.Mesh(geo,new THREE.MeshBasicMaterial({color:labelColor(label),wireframe:true,transparent:true,opacity:.35}));
+      obj.matrixAutoUpdate=false;obj.name=label;
+      mapGroup.add(obj);rec={obj,t:m.lastChangedTime,label};meshRecs.set(m,rec);
+    }
+    const p=frame.getPose(m.meshSpace,ref);
+    if(p){rec.obj.matrix.fromArray(p.transform.matrix);rec.obj.matrixWorldNeedsUpdate=true;}
+  }
+  for(const [m,rec] of meshRecs) if(!set.has(m)){mapGroup.remove(rec.obj);meshRecs.delete(m);}
+}
+function polyArea(pts){let a=0;for(let i=0;i<pts.length;i++){const p=pts[i],q=pts[(i+1)%pts.length];a+=p.x*q.z-q.x*p.z;}return Math.abs(a)/2;}
+function updatePlanes(frame,ref){
+  const set=frame.detectedPlanes; if(!set) return;
+  for(const pl of set){
+    let rec=planeRecs.get(pl);
+    if(!rec||rec.t!==pl.lastChangedTime){
+      if(rec){planeGroup.remove(rec.obj);rec.obj.geometry.dispose();}
+      const shape=new THREE.Shape(pl.polygon.map(p=>new THREE.Vector2(p.x,-p.z)));
+      const geo=new THREE.ShapeGeometry(shape);geo.rotateX(-Math.PI/2);
+      const label=pl.semanticLabel||'other';
+      const obj=new THREE.Mesh(geo,new THREE.MeshBasicMaterial({color:labelColor(label),transparent:true,opacity:.12,side:THREE.DoubleSide,depthWrite:false}));
+      obj.matrixAutoUpdate=false;obj.name=label;
+      planeGroup.add(obj);rec={obj,t:pl.lastChangedTime,label,area:polyArea(pl.polygon)};planeRecs.set(pl,rec);
+    }
+    const p=frame.getPose(pl.planeSpace,ref);
+    if(p){rec.obj.matrix.fromArray(p.transform.matrix);rec.obj.matrixWorldNeedsUpdate=true;}
+  }
+  for(const [pl,rec] of planeRecs) if(!set.has(pl)){planeGroup.remove(rec.obj);planeRecs.delete(pl);}
+}
+
+// ---------- controllers ----------
+const raycaster=new THREE.Raycaster();
+const tmpM=new THREE.Matrix4();
+const reticle=new THREE.Mesh(new THREE.RingGeometry(.04,.06,32).rotateX(-Math.PI/2),new THREE.MeshBasicMaterial({color:0xf2a53a,depthTest:false}));
+reticle.renderOrder=11;reticle.visible=false;scene.add(reticle);
+
+function rayHit(ctrl){
+  tmpM.identity().extractRotation(ctrl.matrixWorld);
+  raycaster.ray.origin.setFromMatrixPosition(ctrl.matrixWorld);
+  raycaster.ray.direction.set(0,0,-1).applyMatrix4(tmpM);
+  mapGroup.updateMatrixWorld();planeGroup.updateMatrixWorld();
+  const hits=raycaster.intersectObjects([...mapGroup.children,...planeGroup.children],false);
+  if(hits.length) return hits[0].point.clone();
+  return raycaster.ray.origin.clone().add(raycaster.ray.direction.clone().multiplyScalar(2));
+}
+
+const controllers=[0,1].map(i=>{
+  const c=renderer.xr.getController(i);
+  const line=new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(),new THREE.Vector3(0,0,-1)]),new THREE.LineBasicMaterial({color:0xf2a53a}));
+  line.scale.z=5;c.add(line);
+  c.userData.prev=[];
+  c.addEventListener('connected',e=>{c.userData.hand=e.data.handedness;c.userData.src=e.data;});
+  c.addEventListener('disconnected',()=>{c.userData.hand=null;c.userData.src=null;});
+  c.addEventListener('selectstart',()=>{ if(c.userData.hand==='right') dropMarker(c); else if(c.userData.hand==='left') measure(c); });
+  c.addEventListener('squeezestart',()=>{ if(c.userData.hand==='left'&&session&&session.initiateRoomCapture){session.initiateRoomCapture().catch(()=>{});} });
+  scene.add(c);return c;
+});
+const ctrl=h=>controllers.find(c=>c.userData.hand===h);
+
+function dropMarker(c){
+  const pos=rayHit(c);const col=STATION_COLORS[stationIdx];const type=STATIONS[stationIdx];
+  const n=markers.filter(m=>m.type===type).length+1;
+  const g=new THREE.Group();g.position.copy(pos);
+  const pole=new THREE.Mesh(new THREE.CylinderGeometry(.015,.015,1.2,8),new THREE.MeshBasicMaterial({color:col}));pole.position.y=.6;g.add(pole);
+  const base=new THREE.Mesh(new THREE.CylinderGeometry(.18,.18,.01,32),new THREE.MeshBasicMaterial({color:col,transparent:true,opacity:.6}));g.add(base);
+  const s=textSprite(`${type} ${n}`,'#'+col.toString(16).padStart(6,'0'));s.position.y=1.35;g.add(s);
+  markerGroup.add(g);markers.push({type,n,colorIdx:stationIdx,pos,obj:g});
+  pulse(c,.4,60);drawHud();
+}
+function undoMarker(){const m=markers.pop();if(m){markerGroup.remove(m.obj);drawHud();}}
+function clearMeasure(){measurePts=[];measureGroup.clear();drawHud();}
+function measure(c){
+  if(measurePts.length>=2) clearMeasure();
+  const p=rayHit(c);measurePts.push(p);
+  const dot=new THREE.Mesh(new THREE.SphereGeometry(.025,16,8),new THREE.MeshBasicMaterial({color:0xffffff,depthTest:false}));dot.position.copy(p);dot.renderOrder=11;measureGroup.add(dot);
+  if(measurePts.length===2){
+    const [a,b]=measurePts;
+    measureGroup.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([a,b]),new THREE.LineBasicMaterial({color:0xffffff,depthTest:false})));
+    const s=textSprite(fmtLen(a.distanceTo(b)),'#ffffff','rgba(10,12,14,.82)',.6);s.position.copy(a.clone().lerp(b,.5)).add(new THREE.Vector3(0,.12,0));measureGroup.add(s);
+  }
+  pulse(c,.3,40);drawHud();
+}
+function fmtLen(m){const inch=m/0.0254;const ft=Math.floor(inch/12);const ins=Math.round(inch-ft*12);return `${m.toFixed(2)} m  (${ft}' ${ins}")`;}
+function pulse(c,v,ms){try{c.userData.src?.gamepad?.hapticActuators?.[0]?.pulse(v,ms);}catch(e){}}
+
+function pollButtons(){
+  for(const c of controllers){
+    const gp=c.userData.src?.gamepad;if(!gp) continue;
+    const now=gp.buttons.map(b=>b.pressed);const prev=c.userData.prev;
+    const edge=i=>now[i]&&!prev[i];
+    if(c.userData.hand==='right'){
+      if(edge(4)){stationIdx=(stationIdx+1)%STATIONS.length;pulse(c,.2,30);drawHud();}
+      if(edge(5)) undoMarker();
+    }else if(c.userData.hand==='left'){
+      if(edge(4)) clearMeasure();
+      if(edge(5)){meshVisible=!meshVisible;mapGroup.visible=planeGroup.visible=meshVisible;drawHud();}
+    }
+    c.userData.prev=now;
+  }
+}
+
+// ---------- in-headset panel on the left controller ----------
+const hudCanvas=document.createElement('canvas');hudCanvas.width=640;hudCanvas.height=400;
+const hudTex=new THREE.CanvasTexture(hudCanvas);
+const hud=new THREE.Mesh(new THREE.PlaneGeometry(.24,.15),new THREE.MeshBasicMaterial({map:hudTex,transparent:true,depthTest:false}));
+hud.renderOrder=12;hud.position.set(0,.1,-.06);hud.rotation.x=-.6;
+function drawHud(){
+  const g=hudCanvas.getContext('2d');g.clearRect(0,0,640,400);
+  g.fillStyle='rgba(18,21,24,.9)';g.fillRect(0,0,640,400);g.fillStyle='#f2a53a';g.fillRect(0,0,640,8);
+  g.fillStyle='#e8ebed';g.font='600 34px system-ui,sans-serif';g.fillText('PPC Shop Mapper',24,56);
+  const col='#'+STATION_COLORS[stationIdx].toString(16).padStart(6,'0');
+  g.font='26px system-ui,sans-serif';g.fillStyle='#97a1a8';g.fillText('Placing (A next · B undo)',24,106);
+  g.fillStyle=col;g.font='600 40px system-ui,sans-serif';g.fillText(STATIONS[stationIdx],24,152);
+  g.fillStyle='#e8ebed';g.font='26px system-ui,sans-serif';
+  const meshN=meshRecs.size,planeN=planeRecs.size;
+  g.fillText(`Markers: ${markers.length}`,24,206);
+  g.fillText(meshN||planeN?`Room scan: ${meshN} mesh · ${planeN} planes${meshVisible?'':' (hidden)'}`:'No room scan yet · left grip = Space Setup',24,246);
+  g.fillText(measurePts.length===2?`Tape: ${fmtLen(measurePts[0].distanceTo(measurePts[1]))}`:measurePts.length===1?'Tape: pull left trigger for point B':'Tape: left trigger',24,286);
+  g.fillStyle='#97a1a8';g.font='22px system-ui,sans-serif';g.fillText('Meta button › exit to finish and save',24,360);
+  hudTex.needsUpdate=true;
+}
+
+// ---------- session ----------
+let lastHud=0;
+renderer.setAnimationLoop((t,frame)=>{
+  if(frame){
+    const ref=renderer.xr.getReferenceSpace();
+    updateMeshes(frame,ref);updatePlanes(frame,ref);pollButtons();
+    const r=ctrl('right');
+    if(r){reticle.visible=true;reticle.position.copy(rayHit(r));}else reticle.visible=false;
+    const l=ctrl('left');
+    if(l&&hud.parent!==l) l.add(hud);
+    if(t-lastHud>1000){drawHud();lastHud=t;}
+  }else if(previewOn){controls.update();}
+  renderer.render(scene,previewOn&&!frame?previewCam:camera);
+});
+
+async function startSession(){
+  try{
+    session=await navigator.xr.requestSession('immersive-ar',{requiredFeatures:['local-floor'],optionalFeatures:['mesh-detection','plane-detection','hit-test','anchors']});
+  }catch(e){setStatus('The headset refused the AR session: '+e.message,'bad');return;}
+  stopPreview();
+  session.addEventListener('end',onEnd);
+  await renderer.xr.setSession(session);
+  sessionStart=performance.now();drawHud();
+  setStatus('Mapping… exit the session to save.','ok');
+}
+function onEnd(){session=null;setStatus(`Session ended. ${markers.length} markers, ${meshRecs.size} mesh pieces captured.`,'ok');showResults();}
+
+// ---------- results + export ----------
+let previewOn=false,previewCam,controls;
+const previewCanvas=$('preview');
+function mapBox(){const b=new THREE.Box3();mapGroup.updateMatrixWorld(true);planeGroup.updateMatrixWorld(true);markerGroup.updateMatrixWorld(true);
+  for(const o of [...mapGroup.children,...planeGroup.children,...markerGroup.children]) b.expandByObject(o);return b;}
+function showResults(){
+  $('results').classList.remove('hidden');
+  const b=mapBox(),sz=new THREE.Vector3();b.getSize(sz);
+  const floorArea=[...planeRecs.values()].filter(r=>r.label==='floor').reduce((a,r)=>a+r.area,0);
+  const labels={};for(const r of meshRecs.values()) labels[r.label]=(labels[r.label]||0)+1;
+  $('summary').textContent=b.isEmpty()?'Nothing was captured. Run Space Setup on the Quest first, then map again.'
+    :`Mapped space ${sz.x.toFixed(1)} × ${sz.z.toFixed(1)} m, ${sz.y.toFixed(1)} m high`+(floorArea?` · floor ${floorArea.toFixed(1)} m² (${(floorArea*10.764).toFixed(0)} ft²)`:'')+` · ${meshRecs.size} mesh pieces (${Object.entries(labels).map(([k,v])=>k+' '+v).join(', ')||'none'}) · ${planeRecs.size} planes · ${markers.length} station markers.`;
+  const rows=markers.map(m=>`<tr><td>${m.type} ${m.n}</td><td class="num">${m.pos.x.toFixed(2)}</td><td class="num">${m.pos.y.toFixed(2)}</td><td class="num">${m.pos.z.toFixed(2)}</td></tr>`).join('');
+  $('stationTable').innerHTML=markers.length?`<tr><th>Station</th><th>X (m)</th><th>Y (m)</th><th>Z (m)</th></tr>${rows}`:'<tr><td>No station markers placed.</td></tr>';
+  startPreview(b);
+}
+function startPreview(b){
+  // reuse the XR renderer's canvas for the 2D preview
+  if(previewCanvas.isConnected) previewCanvas.replaceWith(renderer.domElement);
+  renderer.domElement.id='preview';renderer.domElement.classList.remove('hidden');
+  const w=renderer.domElement.parentElement.clientWidth;renderer.setSize(w,380);
+  previewCam=new THREE.PerspectiveCamera(55,w/380,.05,500);
+  const c=b.isEmpty()?new THREE.Vector3(0,0,0):b.getCenter(new THREE.Vector3());const r=b.isEmpty()?5:b.getSize(new THREE.Vector3()).length();
+  previewCam.position.set(c.x+r*.6,c.y+r*.8,c.z+r*.6);
+  controls=new OrbitControls(previewCam,renderer.domElement);controls.target.copy(c);controls.update();
+  scene.background=new THREE.Color(0x0c0e10);reticle.visible=false;previewOn=true;
+}
+function stopPreview(){previewOn=false;scene.background=null;}
+
+function buildExport(){
+  const out=new THREE.Scene();out.name='PPC Shop Map';
+  const mat={};
+  const solid=l=>mat[l]??=new THREE.MeshStandardMaterial({color:labelColor(l),roughness:.9,name:l});
+  for(const r of meshRecs.values()){const g=r.obj.geometry.clone().applyMatrix4(r.obj.matrix);const m=new THREE.Mesh(g,solid(r.label));m.name='mesh_'+r.label;out.add(m);}
+  for(const r of planeRecs.values()){const g=r.obj.geometry.clone().applyMatrix4(r.obj.matrix);const m=new THREE.Mesh(g,solid(r.label));m.name='plane_'+r.label;out.add(m);}
+  const st=new THREE.Group();st.name='stations';out.add(st);
+  for(const m of markers){const o=new THREE.Object3D();o.name=`STATION ${m.type} ${m.n}`;o.position.copy(m.pos);o.userData={station:m.type,index:m.n};st.add(o);}
+  return out;
+}
+function stamp(){const d=new Date(),p=n=>String(n).padStart(2,'0');return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}`;}
+function download(blob,name){const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;document.body.appendChild(a);a.click();setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove();},2000);}
+$('saveGlb').onclick=()=>{new GLTFExporter().parse(buildExport(),glb=>download(new Blob([glb],{type:'model/gltf-binary'}),`ppc-shop-map_${stamp()}.glb`),e=>setStatus('Could not build the GLB: '+e.message,'bad'),{binary:true});};
+$('saveJson').onclick=()=>{
+  const b=mapBox(),sz=new THREE.Vector3();b.getSize(sz);
+  const data={app:'PPC Shop Mapper',version:'0.1',created:new Date().toISOString(),units:'metres',origin:'Quest local-floor (where mapping started, floor level)',
+    size:{x:+sz.x.toFixed(2),y:+sz.y.toFixed(2),z:+sz.z.toFixed(2)},
+    stations:markers.map(m=>({name:`${m.type} ${m.n}`,type:m.type,x:+m.pos.x.toFixed(3),y:+m.pos.y.toFixed(3),z:+m.pos.z.toFixed(3)}))};
+  download(new Blob([JSON.stringify(data,null,2)],{type:'application/json'}),`ppc-shop-stations_${stamp()}.json`);
+};
+
+// ---------- headset check ----------
+(async()=>{
+  let ok=false;
+  try{ok=!!navigator.xr&&await navigator.xr.isSessionSupported('immersive-ar');}catch(e){}
+  if(ok){startBtn.disabled=false;startBtn.textContent='Start mapping';startBtn.onclick=startSession;setStatus('Headset ready.','ok');}
+  else{startBtn.textContent='Open on the Quest 3';setStatus('This browser has no AR. Open this page in the Quest 3 browser.');}
+})();
+drawHud();
+</script>
+</body>
+</html>
